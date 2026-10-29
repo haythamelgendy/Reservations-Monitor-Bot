@@ -2,7 +2,7 @@ name: Monitor Bot
 
 on:
   schedule:
-    - cron: '*/15 * * * *'  # كل 15 دقيقة - عدّل حسب حاجتك
+    - cron: '2,17,32,47 * * * *'  # كل 15 دقيقة - عدّل حسب حاجتك
   workflow_dispatch:  
 
 permissions:
