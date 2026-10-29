@@ -4,7 +4,8 @@ on:
   schedule:
     - cron: '2,17,32,47 * * * *'  # كل 15 دقيقة - عدّل حسب حاجتك
   workflow_dispatch:  
-
+  push:
+    branches: [main]
 permissions:
   contents: write  
 
