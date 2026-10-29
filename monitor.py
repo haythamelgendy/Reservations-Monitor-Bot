@@ -19,6 +19,7 @@ VOX_BASE_URL = 'https://egy.voxcinemas.com/showtimes?c=city-centre-almaza'
 TAZKARTI_URL = 'https://www.tazkarti.com/#/matches'
 TAZKARTI_MATCH_SELECTOR = 'div.content.matches div.match'
 SENT_FILE = 'sent.txt'
+MONITOR_ERRORS = []
 
 EGYPT_TZ = ZoneInfo("Africa/Cairo")
 
@@ -63,8 +64,8 @@ def vox_url_for_date(d):
 
 def parse_showtime_dt(target_date, time_text):
     try:
-        t = datetime.strptime(time_text.strip().lower(), "%I:%M%p").time()
-    except ValueError:
+        t = datetime.strptime(re.search(r"\d{1,2}:\d{2}\s*[ap]m", time_text.lower())[0].replace(" ", ""), "%I:%M%p").time()
+    except (ValueError, TypeError, AttributeError):
         return None
     return datetime.combine(target_date, t, tzinfo=EGYPT_TZ)
 
@@ -83,28 +84,33 @@ def save_sent_item(item):
 
 def send_telegram_message(message, button_text=None, button_url=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        'chat_id': CHAT_ID,
-        'text': message,
-        'parse_mode': 'HTML',
-        'disable_web_page_preview': True
-    }
+    payload = {'chat_id': CHAT_ID, 'text': message, 'parse_mode': 'HTML',
+               'disable_web_page_preview': True}
     if button_text and button_url:
-        payload['reply_markup'] = {
-            'inline_keyboard': [[{
-                'text': button_text,
-                'url': button_url,
-            }]]
-        }
-    try:
-        resp = requests.post(url, json=payload, timeout=15)
-        if not resp.ok:
-            print(f"Telegram API error: {resp.status_code} {resp.text}")
-            return False
-        return True
-    except Exception as e:
-        print(f"Error sending Telegram message: {e}")
-        return False
+        payload['reply_markup'] = {'inline_keyboard': [[
+            {'text': button_text, 'url': button_url}]]}
+    for attempt in range(3):
+        try:
+            response = requests.post(url, json=payload, timeout=20)
+            data = response.json()
+            if response.ok and data.get('ok') is True:
+                print('Telegram delivery confirmed.')
+                return True
+            if response.status_code == 429:
+                delay = min(60, max(1, int(data.get('parameters', {}).get('retry_after', 3))))
+            elif response.status_code >= 500:
+                delay = 2 ** attempt
+            else:
+                print(f'Telegram rejected delivery (HTTP {response.status_code}).')
+                break
+        except (requests.RequestException, ValueError, TypeError):
+            # Do not print request URLs: they contain the bot token.
+            print('Telegram request failed; no notification history was recorded.')
+            delay = 2 ** attempt
+        if attempt < 2:
+            time.sleep(delay)
+    MONITOR_ERRORS.append('Telegram delivery failed')
+    return False
 
 
 def new_browser():
@@ -225,55 +231,63 @@ def extract_movies(driver):
 
 
 def format_vox_message(movie, day_label, new_showtimes_by_hall):
-    meta_parts = [p for p in [movie["rating"], movie["language"], movie["duration"]] if p]
-    meta_line = " | ".join(meta_parts)
-
-    lines = [f"🎬 <b>{movie['title']}</b>"]
-    if meta_line:
-        lines.append(f"🏷 {meta_line}")
-    lines.append(f"📅 <b>{day_label}</b>")
-    lines.append("")
-
+    escape = html.escape
+    meta = ' | '.join(escape(p) for p in
+                      [movie['rating'], movie['language'], movie['duration']] if p)
+    lines = [f"🎬 <b>{escape(movie['title'][:300])}</b>",
+             '📍 VOX City Centre Almaza']
+    if meta:
+        lines.append(f'🏷 {meta}')
+    lines.extend([f'📅 <b>{escape(day_label)}</b>', ''])
     for hall_name, showtimes in new_showtimes_by_hall.items():
-        time_links = " | ".join(f"<a href='{s['link']}'>{s['time']}</a>" for s in showtimes)
-        lines.append(f"🍿 <b>{hall_name}:</b> {time_links}")
-
-    if movie["info_link"]:
-        lines.append("")
-        lines.append(f"ℹ️ <a href='{movie['info_link']}'>Movie Info</a>")
-
-    return "\n".join(lines)
+        links = ' | '.join(
+            f"<a href='{escape(s['link'], quote=True)}'>{escape(s['time'])}</a>"
+            for s in showtimes)
+        lines.append(f'🍿 <b>{escape(hall_name)}:</b> {links}')
+    if movie['info_link']:
+        lines.extend(['', f"ℹ️ <a href='{escape(movie['info_link'], quote=True)}'>Movie Info</a>"])
+    return '\n'.join(lines)
 
 
 def process_movies_for_date(movies, target_date, sent_items):
-    day_label = date_label(target_date)
-    today = today_egypt()
+    day_label = f'{date_label(target_date)} ({target_date.isoformat()})'
     current_time = now_egypt()
     total_new = 0
-
     for movie in movies:
-        new_by_hall = {}
-        for hall in movie["halls"]:
-            new_showtimes = []
-            for s in hall["showtimes"]:
-                if target_date == today:
-                    showtime_dt = parse_showtime_dt(target_date, s["time"])
-                    if showtime_dt and showtime_dt < current_time:
+        pending = []
+        seen = set(sent_items)
+        for hall in movie['halls']:
+            for show in hall['showtimes']:
+                if target_date < current_time.date():
+                    continue
+                if target_date == current_time.date():
+                    start = parse_showtime_dt(target_date, show['time'])
+                    if start and start <= current_time:
                         continue
-
-                dedupe_key = f"vox:{target_date.isoformat()}:{s['booking_id']}"
-                if dedupe_key not in sent_items:
-                    save_sent_item(dedupe_key)
-                    sent_items.add(dedupe_key)
-                    new_showtimes.append(s)
-            if new_showtimes:
-                new_by_hall[hall["name"]] = new_showtimes
-
-        if new_by_hall:
-            msg = format_vox_message(movie, day_label, new_by_hall)
-            send_telegram_message(msg)
-            total_new += sum(len(v) for v in new_by_hall.values())
-
+                key = f"vox:{target_date.isoformat()}:{show['booking_id']}"
+                if key not in seen:
+                    seen.add(key)
+                    pending.append((hall['name'], show, key))
+        # Bound each Telegram message and persist each accepted batch separately.
+        for offset in range(0, len(pending), 12):
+            batch = pending[offset:offset + 12]
+            by_hall = {}
+            for hall, show, key in batch:
+                by_hall.setdefault(hall, []).append(show)
+            message = format_vox_message(movie, day_label, by_hall)
+            if len(message) > 4000:
+                batches = [[item] for item in batch]
+            else:
+                batches = [batch]
+            for items in batches:
+                halls = {}
+                for hall, show, key in items:
+                    halls.setdefault(hall, []).append(show)
+                if send_telegram_message(format_vox_message(movie, day_label, halls)):
+                    for hall, show, key in items:
+                        save_sent_item(key)
+                        sent_items.add(key)
+                        total_new += 1
     return total_new
 
 
@@ -286,6 +300,7 @@ def check_vox_cinemas(sent_items):
         ok = load_vox_page(driver, VOX_BASE_URL)
         if not ok:
             save_debug_snapshot(driver, "vox_today")
+            MONITOR_ERRORS.append("VOX initial page did not load")
             return
         dates_to_check = discover_open_dates(driver)
         print(f"  Dates currently open for booking: {[d.isoformat() for d in dates_to_check]}")
@@ -308,6 +323,7 @@ def check_vox_cinemas(sent_items):
             ok = load_vox_page(driver, url)
             if not ok:
                 save_debug_snapshot(driver, f"vox_{target_date.isoformat()}")
+                MONITOR_ERRORS.append(f"VOX page failed: {target_date}")
                 continue
             movies = extract_movies(driver)
             total_new += process_movies_for_date(movies, target_date, sent_items)
@@ -645,10 +661,16 @@ def check_tazkarti(sent_items):
 
 
 if __name__ == "__main__":
-    print("Starting Bot...")
+    print(f"Starting Bot. Trigger: {os.environ.get('RUN_EVENT', 'local')}")
+    if os.environ.get("TELEGRAM_TEST", "").lower() == "true":
+        if not send_telegram_message("✅ اختبار VOX Almaza: اتصال Telegram ناجح، ومراقبة الأفلام والحفلات الجديدة تعمل على نفس البوت."):
+            raise SystemExit("Telegram delivery test failed")
     sent_items = load_sent_items()
 
     check_vox_cinemas(sent_items)
     check_tazkarti(sent_items)
 
-    print("Done.")
+    if MONITOR_ERRORS:
+        print(f"Monitoring finished with {len(MONITOR_ERRORS)} error(s). Successful alerts are saved; failed alerts will be retried.")
+        raise SystemExit(1)
+    print("Done. Monitoring succeeded; only Telegram-confirmed alerts were saved.")
