@@ -7786,3 +7786,5 @@ vox:2026-11-23:0047-279021
 vox:2026-11-23:0047-278769
 vox:2026-11-24:0047-279027
 vox:2026-11-24:0047-279048
+tazkarti:al-ahly:basketballmenandjuniorschampionship202620278
+tazkarti:al-ahly:basketballmenandjuniorschampionship2026202710
